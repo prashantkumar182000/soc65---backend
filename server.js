@@ -90,6 +90,7 @@ const connectToMongoDB = async () => {
     await db.collection('userPassions').createIndex({ userId: 1 });
     await db.collection('passionQuestions').createIndex({ id: 1 });
     await db.collection('passionProfiles').createIndex({ tags: 1 });
+    await db.collection('events').createIndex({ 'location.coordinates': '2dsphere' });
     
   } catch (err) {
     console.error('MongoDB connection failed:', err);
@@ -280,7 +281,6 @@ app.post('/api/messages', async (req, res) => {
   }
 });
 
-
 // ================== PASSION FINDER ENDPOINTS ================== //
 
 app.get('/api/passion-questions', async (req, res) => {
@@ -324,7 +324,6 @@ app.post('/api/analyze-passion', async (req, res) => {
       }
     });
 
-    // Removed unused variable 'sortedTags'
     Object.keys(tagFrequency).sort((a, b) => tagFrequency[b] - tagFrequency[a]);
 
     const profiles = await db.collection('passionProfiles').find().toArray();
@@ -405,26 +404,151 @@ app.get('/api/user-passion/:userId', async (req, res) => {
 
 app.get('/api/map', async (req, res) => {
   try {
-    const mapData = await db.collection('mapData').find().toArray();
+    const { lat, lng, radius, category } = req.query;
+    let query = {};
+    
+    if (lat && lng && radius) {
+      query.location = {
+        $near: {
+          $geometry: {
+            type: "Point",
+            coordinates: [parseFloat(lng), parseFloat(lat)]
+          },
+          $maxDistance: parseInt(radius)
+        }
+      };
+    }
+    
+    if (category && category !== 'all') {
+      query.category = category;
+    }
+
+    const mapData = await db.collection('mapData')
+      .find(query)
+      .limit(100)
+      .toArray();
+
     res.status(200).json(mapData);
   } catch (err) {
+    console.error('Failed to fetch map data:', err);
     res.status(500).json({ success: false, message: 'Failed to fetch map data' });
   }
 });
 
 app.post('/api/map', async (req, res) => {
   try {
-    const { location, interest, category } = req.body;
+    const { location, interest, category, name, bio, avatar } = req.body;
+    
+    if (!location || !interest || !category) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Missing required fields' 
+      });
+    }
+
     const newLocation = {
-      location,
+      location: {
+        type: "Point",
+        coordinates: [location.lng, location.lat]
+      },
       interest,
       category,
+      name,
+      bio,
+      avatar,
       timestamp: new Date().toISOString()
     };
-    await db.collection('mapData').insertOne(newLocation);
-    res.status(201).json({ success: true, data: newLocation });
+
+    const result = await db.collection('mapData').insertOne(newLocation);
+    
+    // Trigger Pusher event for real-time updates
+    pusher.trigger('map-updates', 'new-location', {
+      ...newLocation,
+      _id: result.insertedId
+    });
+
+    res.status(201).json({ 
+      success: true, 
+      data: { ...newLocation, _id: result.insertedId }
+    });
   } catch (err) {
+    console.error('Failed to add location:', err);
     res.status(500).json({ success: false, message: 'Failed to add location' });
+  }
+});
+
+// ================== EVENTS ENDPOINTS ================== //
+
+app.get('/api/events', async (req, res) => {
+  try {
+    const { lat, lng, radius } = req.query;
+    let query = {};
+    
+    if (lat && lng && radius) {
+      query.location = {
+        $near: {
+          $geometry: {
+            type: "Point",
+            coordinates: [parseFloat(lng), parseFloat(lat)]
+          },
+          $maxDistance: parseInt(radius)
+        }
+      };
+    }
+
+    const events = await db.collection('events')
+      .find(query)
+      .sort({ date: 1 })
+      .limit(50)
+      .toArray();
+
+    res.status(200).json(events);
+  } catch (err) {
+    console.error('Failed to fetch events:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch events' });
+  }
+});
+
+app.post('/api/events', async (req, res) => {
+  try {
+    const { title, description, date, location, category, host, participants } = req.body;
+    
+    if (!title || !date || !location || !category) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Missing required fields' 
+      });
+    }
+
+    const newEvent = {
+      title,
+      description,
+      date,
+      location: {
+        type: "Point",
+        coordinates: [location.lng, location.lat]
+      },
+      category,
+      host,
+      participants: participants || [],
+      createdAt: new Date().toISOString()
+    };
+
+    const result = await db.collection('events').insertOne(newEvent);
+    
+    // Trigger Pusher event for real-time updates
+    pusher.trigger('map-updates', 'new-event', {
+      ...newEvent,
+      _id: result.insertedId
+    });
+
+    res.status(201).json({ 
+      success: true, 
+      data: { ...newEvent, _id: result.insertedId }
+    });
+  } catch (err) {
+    console.error('Failed to add event:', err);
+    res.status(500).json({ success: false, message: 'Failed to add event' });
   }
 });
 
@@ -522,7 +646,6 @@ app.get('/api/users/:userId/connections', async (req, res) => {
 
 // ================== CONTENT ENDPOINTS ================== //
 
-// Updated refreshTEDTalks function in server.js
 const refreshTEDTalks = async () => {
   try {
     const response = await axios.get('https://ted-talks-api.p.rapidapi.com/talks', {
