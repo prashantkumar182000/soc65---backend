@@ -9,39 +9,56 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Enhanced CORS configuration
-const corsOptions = {
-  origin: [
-    'http://localhost:5173',
-    'https://socio-99-frontend.vercel.app',
-    'https://soc-ial75.netlify.app'
-  ],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Cache-Control'],
-  exposedHeaders: ['Content-Length', 'X-Request-Id'],
-  credentials: true
-};
+// MongoDB configuration
+const mongoUri = process.env.MONGO_URI || 'mongodb+srv://prashantkumar182000:pk00712345@cluster0.tehdo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0&tls=true&tlsAllowInvalidCertificates=true';
+const dbName = 'chatApp';
 
-app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Request logging middleware
+app.use((req, res, next) => {
+  const allowedOrigins = [
+    'http://localhost:5173',
+    'https://socio-99-frontend.vercel.app',
+    'https://soc-ial75.netlify.app'
+  ];
+  const origin = req.headers.origin;
+  
+  if (allowedOrigins.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+  }
+  
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cache-Control');
+  res.header('Access-Control-Expose-Headers', 'Content-Length, X-Request-Id');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  
+  next();
+});
+
+// Add request logging middleware
 app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
   next();
 });
 
-// Rate limiting
+// ================== RATE LIMITING ================== //
 const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per window
   message: 'Too many requests from this IP, please try again later',
-  standardHeaders: true,
-  legacyHeaders: false
+  standardHeaders: true, // Return rate limit info in headers
+  legacyHeaders: false // Disable deprecated headers
 });
 
+// Apply to all API routes
 app.use('/api/', apiLimiter);
+// ================== RATE LIMITING ================== //
 
 // Pusher configuration
 const pusher = new Pusher({
@@ -56,26 +73,23 @@ const pusher = new Pusher({
 let db;
 const connectToMongoDB = async () => {
   try {
-    const client = new MongoClient(process.env.MONGO_URI || 'mongodb+srv://prashantkumar182000:pk00712345@cluster0.tehdo.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0&tls=true&tlsAllowInvalidCertificates=true', {
+    const client = new MongoClient(mongoUri, {
       tls: true,
       tlsAllowInvalidCertificates: true,
     });
     await client.connect();
     console.log('Connected to MongoDB');
-    db = client.db('chatApp');
+    db = client.db(dbName);
 
     // Create indexes
-    await Promise.all([
-      db.collection('messages').createIndex({ channel: 1, timestamp: 1 }),
-      db.collection('messages').createIndex({ replyTo: 1 }),
-      db.collection('mapData').createIndex({ location: '2dsphere' }),
-      db.collection('connections').createIndex({ userId: 1 }),
-      db.collection('connections').createIndex({ connectedUserId: 1 }),
-      db.collection('userPassions').createIndex({ userId: 1 }),
-      db.collection('passionQuestions').createIndex({ id: 1 }),
-      db.collection('passionProfiles').createIndex({ tags: 1 }),
-      db.collection('events').createIndex({ 'location.coordinates': '2dsphere' })
-    ]);
+    await db.collection('messages').createIndex({ channel: 1, timestamp: 1 });
+    await db.collection('messages').createIndex({ replyTo: 1 });
+    await db.collection('mapData').createIndex({ location: '2dsphere' });
+    await db.collection('connections').createIndex({ userId: 1 });
+    await db.collection('connections').createIndex({ connectedUserId: 1 });
+    await db.collection('userPassions').createIndex({ userId: 1 });
+    await db.collection('passionQuestions').createIndex({ id: 1 });
+    await db.collection('passionProfiles').createIndex({ tags: 1 });
     
   } catch (err) {
     console.error('MongoDB connection failed:', err);
@@ -83,7 +97,8 @@ const connectToMongoDB = async () => {
   }
 };
 
-// Pre-loaded data
+// ================== PRE-LOADED DATA ================== //
+
 const DEFAULT_PASSION_QUESTIONS = [
   {
     id: 1,
@@ -174,18 +189,15 @@ const DEFAULT_PASSION_PROFILES = [
   }
 ];
 
-// Initialize passion data
+// Initialize passion data in MongoDB
 const initializePassionData = async () => {
   try {
-    const [questionsCount, profilesCount] = await Promise.all([
-      db.collection('passionQuestions').countDocuments(),
-      db.collection('passionProfiles').countDocuments()
-    ]);
-
+    const questionsCount = await db.collection('passionQuestions').countDocuments();
     if (questionsCount === 0) {
       await db.collection('passionQuestions').insertMany(DEFAULT_PASSION_QUESTIONS);
     }
 
+    const profilesCount = await db.collection('passionProfiles').countDocuments();
     if (profilesCount === 0) {
       await db.collection('passionProfiles').insertMany(DEFAULT_PASSION_PROFILES);
     }
@@ -194,23 +206,27 @@ const initializePassionData = async () => {
   }
 };
 
-// Pusher authentication endpoint
+// ================== CHAT ENDPOINTS ================== //
+
 app.post('/api/pusher/auth', async (req, res) => {
   try {
     const { socket_id: socketId, channel_name: channel } = req.body;
     
+    // Validate required fields
     if (!socketId || !channel) {
       return res.status(400).json({ error: 'Missing socket_id or channel_name' });
     }
 
-    const userId = req.user?.id;
+    // Additional security check (optional)
+    const userId = req.user?.id; // Assuming you have user auth
     if (channel.startsWith('private-') && !userId) {
       return res.status(403).json({ error: 'Unauthorized private channel access' });
     }
 
+    // Generate auth response
     const authResponse = pusher.authorizeChannel(socketId, channel, {
-      user_id: userId?.toString(),
-      user_info: userId ? { id: userId } : {}
+      user_id: userId?.toString(), // For presence channels
+      user_info: userId ? { id: userId } : {} // Additional user data
     });
 
     res.json(authResponse);
@@ -220,7 +236,7 @@ app.post('/api/pusher/auth', async (req, res) => {
   }
 });
 
-// Message endpoints
+// Message Endpoints
 app.get('/api/messages', async (req, res) => {
   try {
     const { channel } = req.query;
@@ -264,7 +280,9 @@ app.post('/api/messages', async (req, res) => {
   }
 });
 
-// Passion finder endpoints
+
+// ================== PASSION FINDER ENDPOINTS ================== //
+
 app.get('/api/passion-questions', async (req, res) => {
   try {
     const questions = await db.collection('passionQuestions').find().toArray();
@@ -306,6 +324,9 @@ app.post('/api/analyze-passion', async (req, res) => {
       }
     });
 
+    // Removed unused variable 'sortedTags'
+    Object.keys(tagFrequency).sort((a, b) => tagFrequency[b] - tagFrequency[a]);
+
     const profiles = await db.collection('passionProfiles').find().toArray();
     
     let bestMatch = null;
@@ -326,6 +347,7 @@ app.post('/api/analyze-passion', async (req, res) => {
     });
 
     const result = bestMatch || DEFAULT_PASSION_PROFILES[0];
+
     res.status(200).json(result);
   } catch (err) {
     res.status(200).json(DEFAULT_PASSION_PROFILES[0]);
@@ -379,156 +401,35 @@ app.get('/api/user-passion/:userId', async (req, res) => {
   }
 });
 
-// Map endpoints
+// ================== MAP ENDPOINTS ================== //
+
 app.get('/api/map', async (req, res) => {
   try {
-    const { lat, lng, radius, category } = req.query;
-    let query = {};
-    
-    if (lat && lng && radius) {
-      query.location = {
-        $near: {
-          $geometry: {
-            type: "Point",
-            coordinates: [parseFloat(lng), parseFloat(lat)]
-          },
-          $maxDistance: parseInt(radius)
-        }
-      };
-    }
-    
-    if (category && category !== 'all') {
-      query.category = category;
-    }
-
-    const mapData = await db.collection('mapData')
-      .find(query)
-      .limit(100)
-      .toArray();
-
+    const mapData = await db.collection('mapData').find().toArray();
     res.status(200).json(mapData);
   } catch (err) {
-    console.error('Failed to fetch map data:', err);
     res.status(500).json({ success: false, message: 'Failed to fetch map data' });
   }
 });
 
 app.post('/api/map', async (req, res) => {
   try {
-    const { location, interest, category, name, bio, avatar } = req.body;
-    
-    if (!location || !interest || !category) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Missing required fields' 
-      });
-    }
-
+    const { location, interest, category } = req.body;
     const newLocation = {
-      location: {
-        type: "Point",
-        coordinates: [location.lng, location.lat]
-      },
+      location,
       interest,
       category,
-      name,
-      bio,
-      avatar,
       timestamp: new Date().toISOString()
     };
-
-    const result = await db.collection('mapData').insertOne(newLocation);
-    
-    pusher.trigger('map-updates', 'new-location', {
-      ...newLocation,
-      _id: result.insertedId
-    });
-
-    res.status(201).json({ 
-      success: true, 
-      data: { ...newLocation, _id: result.insertedId }
-    });
+    await db.collection('mapData').insertOne(newLocation);
+    res.status(201).json({ success: true, data: newLocation });
   } catch (err) {
-    console.error('Failed to add location:', err);
     res.status(500).json({ success: false, message: 'Failed to add location' });
   }
 });
 
-// Event endpoints
-app.get('/api/events', async (req, res) => {
-  try {
-    const { lat, lng, radius } = req.query;
-    let query = {};
-    
-    if (lat && lng && radius) {
-      query.location = {
-        $near: {
-          $geometry: {
-            type: "Point",
-            coordinates: [parseFloat(lng), parseFloat(lat)]
-          },
-          $maxDistance: parseInt(radius)
-        }
-      };
-    }
+// ================== CONNECTION ENDPOINTS ================== //
 
-    const events = await db.collection('events')
-      .find(query)
-      .sort({ date: 1 })
-      .limit(50)
-      .toArray();
-
-    res.status(200).json(events);
-  } catch (err) {
-    console.error('Failed to fetch events:', err);
-    res.status(500).json({ success: false, message: 'Failed to fetch events' });
-  }
-});
-
-app.post('/api/events', async (req, res) => {
-  try {
-    const { title, description, date, location, category, host, participants, registrationLink } = req.body;
-    
-    if (!title || !date || !location || !category) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Missing required fields' 
-      });
-    }
-
-    const newEvent = {
-      title,
-      description,
-      date,
-      location: {
-        type: "Point",
-        coordinates: [location.lng, location.lat]
-      },
-      category,
-      host,
-      participants: participants || [],
-      registrationLink: registrationLink || '#',
-      createdAt: new Date().toISOString()
-    };
-
-    const result = await db.collection('events').insertOne(newEvent);
-    
-    pusher.trigger('map-updates', 'new-event', {
-      ...newEvent,
-      _id: result.insertedId
-    });
-
-    res.status(201).json({ 
-      success: true, 
-      data: { ...newEvent, _id: result.insertedId }
-    });
-  } catch (err) {
-    console.error('Failed to add event:', err);
-    res.status(500).json({ success: false, message: 'Failed to add event' });
-  }
-});
-
-// Connection endpoints
 app.post('/api/connections', async (req, res) => {
   try {
     const { userId, connectedUserId } = req.body;
@@ -619,7 +520,9 @@ app.get('/api/users/:userId/connections', async (req, res) => {
   }
 });
 
-// Content endpoints
+// ================== CONTENT ENDPOINTS ================== //
+
+// Updated refreshTEDTalks function in server.js
 const refreshTEDTalks = async () => {
   try {
     const response = await axios.get('https://ted-talks-api.p.rapidapi.com/talks', {
@@ -656,6 +559,7 @@ app.get('/api/content', async (req, res) => {
   try {
     let talks = [];
     
+    // 1. Try database first
     try {
       talks = await db.collection('tedTalks')
         .find()
@@ -664,12 +568,14 @@ app.get('/api/content', async (req, res) => {
         .toArray();
         
       if (talks.length > 0) {
-        return res.json(talks);
+        return res.json(talks); // Return immediately if DB has data
       }
     } catch (dbError) {
       console.error('Database fetch failed:', dbError);
+      // Continue to API fallback
     }
 
+    // 2. Try RapidAPI if DB is empty
     try {
       const apiResponse = await axios.get('https://ted-talks-api.p.rapidapi.com/talks', {
         headers: {
@@ -684,6 +590,7 @@ app.get('/api/content', async (req, res) => {
         timeout: 5000
       });
 
+      // Transform API response to match your schema
       talks = apiResponse.data.map(talk => ({
         title: talk.title,
         speaker: talk.speaker || 'Unknown Speaker',
@@ -694,6 +601,7 @@ app.get('/api/content', async (req, res) => {
         updatedAt: new Date().toISOString()
       }));
 
+      // Cache the API results in DB
       if (talks.length > 0) {
         await db.collection('tedTalks').insertMany(talks);
       }
@@ -701,16 +609,17 @@ app.get('/api/content', async (req, res) => {
       return res.json(talks);
     } catch (apiError) {
       console.error('API fetch failed:', apiError);
-      return res.status(200).json([]);
+      return res.status(200).json([]); // Return empty array instead of dummy data
     }
     
   } catch (err) {
     console.error('Content endpoint error:', err);
-    res.status(200).json([]);
+    res.status(200).json([]); // Final fallback (empty array)
   }
 });
 
-// NGO endpoints
+// ================== NGO ENDPOINTS ================== //
+
 const refreshNGOs = async () => {
   try {
     const response = await axios.get(
@@ -743,7 +652,8 @@ app.get('/api/action-hub', async (req, res) => {
   }
 });
 
-// Server startup
+// ================== SERVER STARTUP ================== //
+
 const startServer = async () => {
   await connectToMongoDB();
   await initializePassionData();
